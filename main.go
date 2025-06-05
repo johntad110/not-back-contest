@@ -25,7 +25,7 @@ import (
 const (
 	MaxItemsPerSale = 10000
 	MaxItemsPerUser = 10
-	CodeExpiration  = 15 * time.Minute
+	CodeExpiration  = 60 * time.Minute // 1 hour TTL
 )
 
 // Job types for background processing
