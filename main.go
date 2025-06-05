@@ -43,27 +43,35 @@ if saleTotal >= tonumber(ARGV[1]) then
   return {0, "Sale sold out"}
 end
 
+-- Only check purchases against the limit, not checkouts
 local userPurchases = tonumber(redis.call('GET', KEYS[2]) or 0)
-local userCheckouts = tonumber(redis.call('GET', KEYS[3]) or 0)
-if userPurchases + userCheckouts >= tonumber(ARGV[2]) then
+if userPurchases >= tonumber(ARGV[2]) then
   return {0, "User limit reached"}
 end
 
+-- Still track checkouts for informational purposes
 redis.call('INCR', KEYS[3])
 redis.call('EXPIRE', KEYS[3], 3600) -- 1 hour expiration
 return {1, "Success"}
 `
 
-// Redis Lua script for atomic purchase operation
+// Redis Lua script for atomic purchase operations
 // KEYS[1] = sale total key (sale:<saleID>:total)
 // KEYS[2] = user purchases key (sale:<saleID>:user:<userID>:purchases)
 // KEYS[3] = user checkouts key (sale:<saleID>:user:<userID>:checkouts)
 // KEYS[4] = code key (code:<code>)
 // ARGV[1] = MaxItemsPerSale
+// ARGV[2] = MaxItemsPerUser
 const purchaseScript = `
 local saleTotal = tonumber(redis.call('GET', KEYS[1]) or 0)
 if saleTotal >= tonumber(ARGV[1]) then
   return {0, "Sale sold out"}
+end
+
+-- Check if user has reached their purchase limit
+local userPurchases = tonumber(redis.call('GET', KEYS[2]) or 0)
+if userPurchases >= tonumber(ARGV[2]) then
+  return {0, "User purchase limit reached"}
 end
 
 -- Increment sale total counter
@@ -428,7 +436,7 @@ func purchaseHandler(w http.ResponseWriter, r *http.Request) {
 		userPurchasesKey,
 		userCheckoutsKey,
 		codeKey,
-	}, MaxItemsPerSale).Result()
+	}, MaxItemsPerSale, MaxItemsPerUser).Result()
 
 	if err != nil {
 		log.Printf("Error executing purchase script: %v", err)
