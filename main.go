@@ -11,7 +11,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -30,9 +29,61 @@ var (
 	ctx         = context.Background()
 	redisClient *redis.Client
 	db          *sql.DB
-	saleMutex   sync.Mutex
-	currentSale int
 )
+
+// Redis Lua script for atomic checkout validation and counter increment
+// KEYS[1] = sale total key (sale:<saleID>:total)
+// KEYS[2] = user purchases key (sale:<saleID>:user:<userID>:purchases)
+// KEYS[3] = user checkouts key (sale:<saleID>:user:<userID>:checkouts)
+// ARGV[1] = MaxItemsPerSale
+// ARGV[2] = MaxItemsPerUser
+const checkoutScript = `
+local saleTotal = tonumber(redis.call('GET', KEYS[1]) or 0)
+if saleTotal >= tonumber(ARGV[1]) then
+  return {0, "Sale sold out"}
+end
+
+local userPurchases = tonumber(redis.call('GET', KEYS[2]) or 0)
+local userCheckouts = tonumber(redis.call('GET', KEYS[3]) or 0)
+if userPurchases + userCheckouts >= tonumber(ARGV[2]) then
+  return {0, "User limit reached"}
+end
+
+redis.call('INCR', KEYS[3])
+redis.call('EXPIRE', KEYS[3], 3600) -- 1 hour expiration
+return {1, "Success"}
+`
+
+// Redis Lua script for atomic purchase operation
+// KEYS[1] = sale total key (sale:<saleID>:total)
+// KEYS[2] = user purchases key (sale:<saleID>:user:<userID>:purchases)
+// KEYS[3] = user checkouts key (sale:<saleID>:user:<userID>:checkouts)
+// KEYS[4] = code key (code:<code>)
+// ARGV[1] = MaxItemsPerSale
+const purchaseScript = `
+local saleTotal = tonumber(redis.call('GET', KEYS[1]) or 0)
+if saleTotal >= tonumber(ARGV[1]) then
+  return {0, "Sale sold out"}
+end
+
+-- Increment sale total counter
+redis.call('INCR', KEYS[1])
+
+-- Increment user purchases counter
+redis.call('INCR', KEYS[2])
+redis.call('EXPIRE', KEYS[2], 3600) -- 1 hour expiration
+
+-- Decrement user checkouts counter
+local checkouts = tonumber(redis.call('GET', KEYS[3]) or 0)
+if checkouts > 0 then
+  redis.call('DECR', KEYS[3])
+end
+
+-- Delete the code
+redis.call('DEL', KEYS[4])
+
+return {1, "Success"}
+`
 
 type CheckoutResponse struct {
 	Code string `json:"code"`
@@ -118,14 +169,16 @@ func init() {
 	}
 
 	// Initialize current sale
-	initializeSale()
+	saleID := currentSaleID()
+	ensureSaleExists(saleID)
 
 	// Start a goroutine to create a new sale every hour
 	go manageSales()
 }
 
-// getSaleEpoch returns the start of the current hour in UTC as Unix timestamp
-func getSaleEpoch() int {
+// currentSaleID returns the current sale ID based on the UTC hour boundary
+// This is a stateless function that doesn't require a mutex
+func currentSaleID() int {
 	// Get current time in UTC
 	now := time.Now().UTC()
 	// Truncate to the start of the current hour
@@ -134,39 +187,32 @@ func getSaleEpoch() int {
 	return int(hourStart.Unix())
 }
 
-func initializeSale() {
-	saleMutex.Lock()
-	defer saleMutex.Unlock()
-
-	// Get the current hour-aligned epoch time
-	saleEpoch := getSaleEpoch()
-
+// ensureSaleExists makes sure the sale record exists in the database
+// and initializes Redis counters if needed
+func ensureSaleExists(saleID int) error {
 	// Check if there's already a sale for this hour
-	var saleID int
 	var itemsSold int
-
-	err := db.QueryRow("SELECT id, items_sold FROM sales WHERE id = $1", saleEpoch).Scan(&saleID, &itemsSold)
-	if err != nil && err != sql.ErrNoRows {
-		log.Printf("Error checking current sale: %v", err)
-	}
+	err := db.QueryRow("SELECT items_sold FROM sales WHERE id = $1", saleID).Scan(&itemsSold)
 
 	// If no sale exists for this hour, create a new one
 	if err == sql.ErrNoRows {
 		// Create a new sale with the epoch as the ID
 		_, err = db.Exec("INSERT INTO sales (id, start_time, items_sold) VALUES ($1, $2, 0)",
-			saleEpoch, time.Unix(int64(saleEpoch), 0))
+			saleID, time.Unix(int64(saleID), 0))
 		if err != nil {
 			log.Printf("Error creating new sale: %v", err)
-			return
+			return err
 		}
 		itemsSold = 0
-		saleID = saleEpoch
+	} else if err != nil {
+		log.Printf("Error checking current sale: %v", err)
+		return err
 	}
 
-	currentSale = saleID
-
-	// Initialize Redis counters for the sale
-	redisClient.Set(ctx, fmt.Sprintf("sale:%d:total", currentSale), itemsSold, 0)
+	// Initialize Redis counters for the sale if they don't exist
+	// Using SET NX to only set if the key doesn't exist
+	redisClient.SetNX(ctx, fmt.Sprintf("sale:%d:total", saleID), itemsSold, 0)
+	return nil
 }
 
 func manageSales() {
@@ -179,8 +225,13 @@ func manageSales() {
 		// Sleep until the next hour boundary
 		time.Sleep(duration)
 
-		// Initialize the sale for the new hour
-		initializeSale()
+		// Get the sale ID for the new hour
+		saleID := currentSaleID()
+
+		// Ensure the sale exists in the database
+		if err := ensureSaleExists(saleID); err != nil {
+			log.Printf("Error ensuring sale exists: %v", err)
+		}
 	}
 }
 
@@ -222,59 +273,66 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := r.URL.Query().Get("user_id")
-	itemID := r.URL.Query().Get("id")
+	// Parse the request body
+	var req struct {
+		UserID string `json:"user_id"`
+		ItemID string `json:"item_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	userID := req.UserID
+	itemID := req.ItemID
 
 	if userID == "" || itemID == "" {
-		http.Error(w, "Missing user_id or id param", http.StatusBadRequest)
+		http.Error(w, "User ID and Item ID are required", http.StatusBadRequest)
 		return
 	}
 
-	// Ensure we're using the current hour's sale
-	initializeSale()
+	// Get the current sale ID using the stateless function
+	saleID := currentSaleID()
 
-	// Get the current sale ID
-	saleMutex.Lock()
-	saleID := currentSale
-	saleMutex.Unlock()
-
-	// Get current items sold count
-	totalSoldStr, err := redisClient.Get(ctx, fmt.Sprintf("sale:%d:total", saleID)).Result()
-	if err != nil && err != redis.Nil {
-		log.Printf("Error getting total sold: %v", err)
+	// Ensure the sale exists in the database
+	if err := ensureSaleExists(saleID); err != nil {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	totalSold := 0
-	if totalSoldStr != "" {
-		totalSold, _ = strconv.Atoi(totalSoldStr)
-	}
-
-	if totalSold >= MaxItemsPerSale {
-		http.Error(w, "Sale sold out", http.StatusConflict)
-		return
-	}
-
-	// Verify user hasn't exceeded their limit
+	// Use Redis Lua script for atomic checkout validation and counter increment
+	ctx := context.Background()
+	saleKey := fmt.Sprintf("sale:%d:total", saleID)
 	userPurchasesKey := fmt.Sprintf("sale:%d:user:%s:purchases", saleID, userID)
-	userPurchases, err := redisClient.Get(ctx, userPurchasesKey).Int()
-	if err != nil && err != redis.Nil {
-		log.Printf("Error getting user purchases: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
 	userCheckoutsKey := fmt.Sprintf("sale:%d:user:%s:checkouts", saleID, userID)
-	userCheckouts, err := redisClient.Get(ctx, userCheckoutsKey).Int()
-	if err != nil && err != redis.Nil {
-		log.Printf("Error getting user checkouts: %v", err)
+
+	// Execute the checkout script
+	result, err := redisClient.Eval(ctx, checkoutScript, []string{
+		saleKey,
+		userPurchasesKey,
+		userCheckoutsKey,
+	}, MaxItemsPerSale, MaxItemsPerUser).Result()
+
+	if err != nil {
+		log.Printf("Error executing checkout script: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	if userPurchases+userCheckouts >= MaxItemsPerUser {
-		http.Error(w, fmt.Sprintf("User has reached the maximum limit of %d items", MaxItemsPerUser), http.StatusForbidden)
+	// Check the result
+	resultArray, ok := result.([]interface{})
+	if !ok || len(resultArray) < 2 {
+		log.Printf("Invalid result from checkout script: %v", result)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	success, _ := resultArray[0].(int64)
+	message, _ := resultArray[1].(string)
+
+	if success != 1 {
+		http.Error(w, message, http.StatusBadRequest)
 		return
 	}
 
@@ -295,8 +353,8 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 	// Store in Redis with expiration
 	redisClient.Set(ctx, fmt.Sprintf("code:%s", code), fmt.Sprintf("%s:%s:%d", userID, itemID, saleID), CodeExpiration)
 
-	// Increment user checkouts counter
-	redisClient.Incr(ctx, userCheckoutsKey)
+	// Note: We don't need to increment user checkouts counter here as it was already done by the Lua script
+	// Set expiration on the user checkouts key to ensure it expires after 1 hour
 	redisClient.Expire(ctx, userCheckoutsKey, 1*time.Hour)
 
 	// Return the code
@@ -310,13 +368,14 @@ func purchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure we're using the current hour's sale
-	initializeSale()
+	// Get the current sale ID using the stateless function
+	currentSaleID := currentSaleID()
 
-	// Get the current sale ID
-	saleMutex.Lock()
-	currentSaleID := currentSale
-	saleMutex.Unlock()
+	// Ensure the sale exists in the database
+	if err := ensureSaleExists(currentSaleID); err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
@@ -324,7 +383,8 @@ func purchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check code exists in Redis
+	// Check if the code exists in Redis
+	ctx := context.Background()
 	codeKey := fmt.Sprintf("code:%s", code)
 	codeValue, err := redisClient.Get(ctx, codeKey).Result()
 	if err == redis.Nil {
@@ -336,108 +396,99 @@ func purchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse code value (format: userID:itemID:saleID)
-	codeData := strings.Split(codeValue, ":")
-	if len(codeData) != 3 {
+	// Parse the code value to get userID, itemID, and saleID
+	parts := strings.Split(codeValue, ":")
+	if len(parts) != 3 {
 		http.Error(w, "Invalid code format", http.StatusBadRequest)
 		return
 	}
 
-	userID := codeData[0]
-	itemID := codeData[1]
-	saleID, _ := strconv.Atoi(codeData[2])
-
-	// Verify that the code is from the current sale window
-	if saleID != currentSaleID {
-		http.Error(w, "Code is from a previous sale window and has expired", http.StatusBadRequest)
+	userID := parts[0]
+	itemID := parts[1]
+	codeSaleID, err := strconv.Atoi(parts[2])
+	if err != nil {
+		http.Error(w, "Invalid code format", http.StatusBadRequest)
 		return
 	}
 
-	// Check if code has been used
-	var used bool
-	err = db.QueryRow("SELECT used FROM checkout_attempts WHERE code = $1", code).Scan(&used)
+	// Verify the code is for the current sale
+	if codeSaleID != currentSaleID {
+		http.Error(w, "Code is from a previous sale window", http.StatusBadRequest)
+		return
+	}
+
+	// Use Redis Lua script for atomic purchase operation
+	saleKey := fmt.Sprintf("sale:%d:total", currentSaleID)
+	userPurchasesKey := fmt.Sprintf("sale:%d:user:%s:purchases", currentSaleID, userID)
+	userCheckoutsKey := fmt.Sprintf("sale:%d:user:%s:checkouts", currentSaleID, userID)
+
+	// Execute the purchase script
+	result, err := redisClient.Eval(ctx, purchaseScript, []string{
+		saleKey,
+		userPurchasesKey,
+		userCheckoutsKey,
+		codeKey,
+	}, MaxItemsPerSale).Result()
+
 	if err != nil {
-		log.Printf("Error checking if code is used: %v", err)
+		log.Printf("Error executing purchase script: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	if used {
-		http.Error(w, "Code has already been used", http.StatusConflict)
+	// Check the result
+	resultArray, ok := result.([]interface{})
+	if !ok || len(resultArray) < 2 {
+		log.Printf("Invalid result from purchase script: %v", result)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Begin transaction
+	success, _ := resultArray[0].(int64)
+	message, _ := resultArray[1].(string)
+
+	if success != 1 {
+		http.Error(w, message, http.StatusBadRequest)
+		return
+	}
+
+	// Begin a transaction to record the purchase and update sale count in the database
 	tx, err := db.Begin()
 	if err != nil {
-		log.Printf("Error starting transaction: %v", err)
+		log.Printf("Error beginning transaction: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	defer tx.Rollback()
 
-	// Check if sale is still active and not sold out
-	var itemsSold int
-	err = tx.QueryRow("SELECT items_sold FROM sales WHERE id = $1", saleID).Scan(&itemsSold)
-	if err != nil {
-		log.Printf("Error checking sale: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	if itemsSold >= MaxItemsPerSale {
-		http.Error(w, "Sale sold out", http.StatusConflict)
-		return
-	}
-
-	// Mark code as used
-	_, err = tx.Exec("UPDATE checkout_attempts SET used = true WHERE code = $1", code)
-	if err != nil {
-		log.Printf("Error marking code as used: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
 	// Record the purchase
 	_, err = tx.Exec(
 		"INSERT INTO purchases (user_id, item_id, code, sale_id, purchased_at) VALUES ($1, $2, $3, $4, $5)",
-		userID, itemID, code, saleID, time.Now(),
+		userID, itemID, code, currentSaleID, time.Now(),
 	)
 	if err != nil {
-		log.Printf("Error recording purchase: %v", err)
+		log.Printf("Error inserting purchase: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Update items sold count
-	_, err = tx.Exec("UPDATE sales SET items_sold = items_sold + 1 WHERE id = $1", saleID)
+	// Update the sale count
+	_, err = tx.Exec(
+		"UPDATE sales SET items_sold = items_sold + 1 WHERE id = $1",
+		currentSaleID,
+	)
 	if err != nil {
-		log.Printf("Error updating items sold: %v", err)
+		log.Printf("Error updating sale count: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Commit transaction
-	if err = tx.Commit(); err != nil {
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
 		log.Printf("Error committing transaction: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-
-	// Update Redis
-	// Increment total sold counter
-	redisClient.Incr(ctx, fmt.Sprintf("sale:%d:total", saleID))
-
-	// Increment user purchases counter and decrement checkouts counter
-	userPurchasesKey := fmt.Sprintf("sale:%d:user:%s:purchases", saleID, userID)
-	redisClient.Incr(ctx, userPurchasesKey)
-	redisClient.Expire(ctx, userPurchasesKey, 1*time.Hour)
-
-	userCheckoutsKey := fmt.Sprintf("sale:%d:user:%s:checkouts", saleID, userID)
-	redisClient.Decr(ctx, userCheckoutsKey)
-
-	// Delete the code from Redis
-	redisClient.Del(ctx, codeKey)
 
 	// Generate item details
 	item := generateItem(itemID)
