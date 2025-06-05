@@ -9,8 +9,11 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -25,10 +28,30 @@ const (
 	CodeExpiration  = 15 * time.Minute
 )
 
+// Job types for background processing
+type CheckoutJob struct {
+	UserID    string
+	ItemID    string
+	Code      string
+	SaleID    int
+	CreatedAt time.Time
+}
+
+type PurchaseJob struct {
+	UserID      string
+	ItemID      string
+	Code        string
+	SaleID      int
+	PurchasedAt time.Time
+}
+
 var (
-	ctx         = context.Background()
-	redisClient *redis.Client
-	db          *sql.DB
+	ctx             = context.Background()
+	redisClient     *redis.Client
+	db              *sql.DB
+	checkoutJobChan = make(chan CheckoutJob, 1000) // Buffer size of 1000
+	purchaseJobChan = make(chan PurchaseJob, 1000) // Buffer size of 1000
+	wg              sync.WaitGroup                 // For graceful shutdown
 )
 
 // Redis Lua script for atomic checkout validation and counter increment
@@ -111,6 +134,402 @@ type Item struct {
 	Image string `json:"image"`
 }
 
+// processCheckoutJobs handles the background processing of checkout attempts
+func processCheckoutJobs() {
+	defer wg.Done()
+	for job := range checkoutJobChan {
+		// Persist the checkout attempt in PostgreSQL
+		_, err := db.Exec(
+			"INSERT INTO checkout_attempts (user_id, item_id, code, sale_id, created_at) VALUES ($1, $2, $3, $4, $5)",
+			job.UserID, job.ItemID, job.Code, job.SaleID, job.CreatedAt,
+		)
+		if err != nil {
+			log.Printf("Error inserting checkout attempt: %v", err)
+			// Retry logic - we'll retry up to 3 times with exponential backoff
+			retryCheckoutJob(job, 1)
+		}
+	}
+}
+
+// retryCheckoutJob attempts to retry a failed checkout job with exponential backoff
+func retryCheckoutJob(job CheckoutJob, attempt int) {
+	if attempt > 3 {
+		log.Printf("Failed to insert checkout attempt after 3 retries: %s, %s, %s", job.UserID, job.ItemID, job.Code)
+		return
+	}
+
+	// Exponential backoff: 1s, 2s, 4s
+	backoff := time.Duration(1<<(attempt-1)) * time.Second
+	time.Sleep(backoff)
+
+	_, err := db.Exec(
+		"INSERT INTO checkout_attempts (user_id, item_id, code, sale_id, created_at) VALUES ($1, $2, $3, $4, $5)",
+		job.UserID, job.ItemID, job.Code, job.SaleID, job.CreatedAt,
+	)
+	if err != nil {
+		log.Printf("Retry %d failed for checkout attempt: %v", attempt, err)
+		retryCheckoutJob(job, attempt+1)
+	} else {
+		log.Printf("Successfully inserted checkout attempt on retry %d", attempt)
+	}
+}
+
+// processPurchaseJobs handles the background processing of purchases
+func processPurchaseJobs() {
+	defer wg.Done()
+	for job := range purchaseJobChan {
+		processPurchase(job, 0)
+	}
+}
+
+// processPurchase processes a purchase job with retry logic
+func processPurchase(job PurchaseJob, attempt int) {
+	// Max retries
+	if attempt > 3 {
+		log.Printf("Failed to process purchase after 3 retries: %s, %s, %s", job.UserID, job.ItemID, job.Code)
+		return
+	}
+
+	// If this is a retry, add exponential backoff
+	if attempt > 0 {
+		backoff := time.Duration(1<<(attempt-1)) * time.Second
+		time.Sleep(backoff)
+	}
+
+	// Begin a transaction to record the purchase and update sale count
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("Error beginning transaction: %v", err)
+		processPurchase(job, attempt+1)
+		return
+	}
+
+	// Record the purchase
+	_, err = tx.Exec(
+		"INSERT INTO purchases (user_id, item_id, code, sale_id, purchased_at) VALUES ($1, $2, $3, $4, $5)",
+		job.UserID, job.ItemID, job.Code, job.SaleID, job.PurchasedAt,
+	)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("Error inserting purchase: %v", err)
+		processPurchase(job, attempt+1)
+		return
+	}
+
+	// Update the sale count
+	_, err = tx.Exec(
+		"UPDATE sales SET items_sold = items_sold + 1 WHERE id = $1",
+		job.SaleID,
+	)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("Error updating sale count: %v", err)
+		processPurchase(job, attempt+1)
+		return
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing transaction: %v", err)
+		processPurchase(job, attempt+1)
+		return
+	}
+
+	if attempt > 0 {
+		log.Printf("Successfully processed purchase on retry %d", attempt)
+	}
+}
+
+// reconcileRedisWithDB periodically checks for mismatches between Redis and the database
+func reconcileRedisWithDB() {
+	defer wg.Done()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Get the current sale ID
+			saleID := currentSaleID()
+
+			// Reconcile sale total count
+			reconcileSaleTotal(saleID)
+
+			// Check for codes in Redis that aren't in the database
+			reconcileCodes(saleID)
+
+			// Check for checkout attempts in the database that aren't in Redis
+			reconcileCheckouts(saleID)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// reconcileCheckouts checks for checkout attempts in the database that aren't in Redis
+func reconcileCheckouts(saleID int) {
+	// Get recent checkout attempts from the database that aren't marked as used
+	rows, err := db.Query(
+		"SELECT code, user_id, item_id FROM checkout_attempts WHERE sale_id = $1 AND used = FALSE AND created_at > NOW() - INTERVAL '15 minutes'",
+		saleID,
+	)
+	if err != nil {
+		log.Printf("Error getting recent checkout attempts: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	// Check each code
+	for rows.Next() {
+		var code, userID, itemID string
+		if err := rows.Scan(&code, &userID, &itemID); err != nil {
+			log.Printf("Error scanning row: %v", err)
+			continue
+		}
+
+		// Check if the code exists in Redis
+		codeKey := fmt.Sprintf("code:%s", code)
+		exists, err := redisClient.Exists(ctx, codeKey).Result()
+		if err != nil {
+			log.Printf("Error checking if code exists in Redis: %v", err)
+			continue
+		}
+
+		// If the code doesn't exist in Redis but should (within TTL period), add it
+		if exists == 0 {
+			log.Printf("Found code in DB not in Redis: %s, adding to Redis", code)
+
+			// Set the code in Redis with the original TTL
+			codeValue := fmt.Sprintf("%s:%s:%d", userID, itemID, saleID)
+			err = redisClient.Set(ctx, codeKey, codeValue, CodeExpiration).Err()
+			if err != nil {
+				log.Printf("Error setting code in Redis: %v", err)
+				continue
+			}
+
+			// Increment the user's checkout count
+			userCheckoutKey := fmt.Sprintf("user:%s:sale:%d:checkouts", userID, saleID)
+			err = redisClient.Incr(ctx, userCheckoutKey).Err()
+			if err != nil {
+				log.Printf("Error incrementing user checkout count: %v", err)
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating over rows: %v", err)
+	}
+}
+
+// reconcileSaleTotal ensures the sale total in Redis matches the database
+func reconcileSaleTotal(saleID int) {
+	// Get the sale total from the database
+	var dbTotal int
+	err := db.QueryRow("SELECT items_sold FROM sales WHERE id = $1", saleID).Scan(&dbTotal)
+	if err != nil {
+		log.Printf("Error getting sale total from database: %v", err)
+		return
+	}
+
+	// Get the sale total from Redis
+	saleKey := fmt.Sprintf("sale:%d:total", saleID)
+	redisTotal, err := redisClient.Get(ctx, saleKey).Int()
+	if err != nil && err != redis.Nil {
+		log.Printf("Error getting sale total from Redis: %v", err)
+		return
+	}
+
+	// If Redis total is nil, set it to the database total
+	if err == redis.Nil {
+		redisClient.Set(ctx, saleKey, dbTotal, 0)
+		return
+	}
+
+	// If there's a mismatch, update Redis to match the database
+	if redisTotal != dbTotal {
+		log.Printf("Reconciling sale total: Redis=%d, DB=%d", redisTotal, dbTotal)
+		redisClient.Set(ctx, saleKey, dbTotal, 0)
+	}
+}
+
+// reconcileCodes checks for codes in Redis that aren't in the database
+func reconcileCodes(saleID int) {
+	// Get all code keys for the current sale
+	keys, err := redisClient.Keys(ctx, "code:*").Result()
+	if err != nil {
+		log.Printf("Error getting code keys from Redis: %v", err)
+		return
+	}
+
+	// Check each code
+	for _, key := range keys {
+		// Extract the code from the key
+		code := strings.TrimPrefix(key, "code:")
+
+		// Get the code value
+		codeValue, err := redisClient.Get(ctx, key).Result()
+		if err != nil {
+			continue // Code might have expired
+		}
+
+		// Parse the code value
+		parts := strings.Split(codeValue, ":")
+		if len(parts) != 3 {
+			continue
+		}
+
+		userID := parts[0]
+		itemID := parts[1]
+		codeSaleID, err := strconv.Atoi(parts[2])
+		if err != nil {
+			continue
+		}
+
+		// Only check codes for the current sale
+		if codeSaleID != saleID {
+			continue
+		}
+
+		// Check if the code exists in the database
+		var count int
+		err = db.QueryRow("SELECT COUNT(*) FROM checkout_attempts WHERE code = $1", code).Scan(&count)
+		if err != nil {
+			log.Printf("Error checking code in database: %v", err)
+			continue
+		}
+
+		// If the code doesn't exist in the database, add it
+		if count == 0 {
+			log.Printf("Found code in Redis not in DB: %s, adding to database", code)
+			_, err = db.Exec(
+				"INSERT INTO checkout_attempts (user_id, item_id, code, sale_id, created_at) VALUES ($1, $2, $3, $4, $5)",
+				userID, itemID, code, saleID, time.Now(),
+			)
+			if err != nil {
+				log.Printf("Error inserting missing code into database: %v", err)
+			}
+		}
+	}
+
+	// Also check for missing purchases in the database
+	reconcilePurchases(saleID)
+}
+
+// reconcilePurchases checks for purchases that haven't been recorded in the database
+func reconcilePurchases(saleID int) {
+	// Get all user purchase counts from Redis
+	userPurchaseKeys, err := redisClient.Keys(ctx, fmt.Sprintf("user:*:sale:%d:purchases", saleID)).Result()
+	if err != nil {
+		log.Printf("Error getting user purchase keys from Redis: %v", err)
+		return
+	}
+
+	// Check each user's purchases
+	for _, key := range userPurchaseKeys {
+		// Extract the user ID from the key
+		// Format: user:<userID>:sale:<saleID>:purchases
+		parts := strings.Split(key, ":")
+		if len(parts) != 5 {
+			continue
+		}
+		userID := parts[1]
+
+		// Get the user's purchase count from Redis
+		redisPurchaseCount, err := redisClient.Get(ctx, key).Int()
+		if err != nil {
+			log.Printf("Error getting purchase count from Redis for user %s: %v", userID, err)
+			continue
+		}
+
+		// Get the user's purchase count from the database
+		var dbPurchaseCount int
+		err = db.QueryRow(
+			"SELECT COUNT(*) FROM purchases WHERE user_id = $1 AND sale_id = $2",
+			userID, saleID,
+		).Scan(&dbPurchaseCount)
+		if err != nil {
+			log.Printf("Error getting purchase count from database for user %s: %v", userID, err)
+			continue
+		}
+
+		// If there's a mismatch, check for unused codes that should be marked as used
+		if redisPurchaseCount > dbPurchaseCount {
+			log.Printf("Purchase count mismatch for user %s: Redis=%d, DB=%d", userID, redisPurchaseCount, dbPurchaseCount)
+
+			// Get the user's checkout attempts that aren't marked as used
+			rows, err := db.Query(
+				"SELECT code, item_id FROM checkout_attempts WHERE user_id = $1 AND sale_id = $2 AND used = FALSE",
+				userID, saleID,
+			)
+			if err != nil {
+				log.Printf("Error getting unused checkout attempts: %v", err)
+				continue
+			}
+			defer rows.Close()
+
+			// Mark codes as used and create purchase records until counts match
+			neededPurchases := redisPurchaseCount - dbPurchaseCount
+			for rows.Next() && neededPurchases > 0 {
+				var code, itemID string
+				if err := rows.Scan(&code, &itemID); err != nil {
+					log.Printf("Error scanning row: %v", err)
+					continue
+				}
+
+				// Start a transaction
+				tx, err := db.Begin()
+				if err != nil {
+					log.Printf("Error starting transaction: %v", err)
+					continue
+				}
+
+				// Mark the code as used
+				_, err = tx.Exec(
+					"UPDATE checkout_attempts SET used = TRUE WHERE code = $1",
+					code,
+				)
+				if err != nil {
+					tx.Rollback()
+					log.Printf("Error marking code as used: %v", err)
+					continue
+				}
+
+				// Insert a purchase record
+				_, err = tx.Exec(
+					"INSERT INTO purchases (user_id, item_id, code, sale_id, purchased_at) VALUES ($1, $2, $3, $4, $5)",
+					userID, itemID, code, saleID, time.Now(),
+				)
+				if err != nil {
+					tx.Rollback()
+					log.Printf("Error inserting purchase record: %v", err)
+					continue
+				}
+
+				// Update the sale count
+				_, err = tx.Exec(
+					"UPDATE sales SET items_sold = items_sold + 1 WHERE id = $1",
+					saleID,
+				)
+				if err != nil {
+					tx.Rollback()
+					log.Printf("Error updating sale count: %v", err)
+					continue
+				}
+
+				// Commit the transaction
+				if err := tx.Commit(); err != nil {
+					log.Printf("Error committing transaction: %v", err)
+					continue
+				}
+
+				log.Printf("Reconciled purchase for user %s, code %s", userID, code)
+				neededPurchases--
+			}
+		}
+	}
+}
+
 func init() {
 	// Initialize Redis client
 	redisURL := os.Getenv("REDIS_URL")
@@ -179,6 +598,12 @@ func init() {
 	// Initialize current sale
 	saleID := currentSaleID()
 	ensureSaleExists(saleID)
+
+	// Start background workers
+	wg.Add(3) // One for checkout jobs, one for purchase jobs, one for reconciliation
+	go processCheckoutJobs()
+	go processPurchaseJobs()
+	go reconcileRedisWithDB()
 
 	// Start a goroutine to create a new sale every hour
 	go manageSales()
@@ -271,8 +696,36 @@ func main() {
 	http.HandleFunc("/checkout", checkoutHandler)
 	http.HandleFunc("/purchase", purchaseHandler)
 
-	fmt.Println("Server starting on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Set up graceful shutdown
+	server := &http.Server{Addr: ":8080"}
+
+	// Start the server in a goroutine
+	go func() {
+		fmt.Println("Server starting on :8080...")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	// Shutdown the server
+	fmt.Println("Shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server shutdown error: %v", err)
+	}
+
+	// Close job channels and wait for workers to finish
+	close(checkoutJobChan)
+	close(purchaseJobChan)
+	wg.Wait()
+
+	fmt.Println("Server gracefully stopped")
 }
 
 func checkoutHandler(w http.ResponseWriter, r *http.Request) {
@@ -347,25 +800,22 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 	// Generate a unique one-time-use code
 	code := uuid.New().String()
 
-	// Persist the checkout attempt in PostgreSQL
-	_, err = db.Exec(
-		"INSERT INTO checkout_attempts (user_id, item_id, code, sale_id, created_at) VALUES ($1, $2, $3, $4, $5)",
-		userID, itemID, code, saleID, time.Now(),
-	)
-	if err != nil {
-		log.Printf("Error inserting checkout attempt: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
 	// Store in Redis with expiration
 	redisClient.Set(ctx, fmt.Sprintf("code:%s", code), fmt.Sprintf("%s:%s:%d", userID, itemID, saleID), CodeExpiration)
 
-	// Note: We don't need to increment user checkouts counter here as it was already done by the Lua script
 	// Set expiration on the user checkouts key to ensure it expires after 1 hour
 	redisClient.Expire(ctx, userCheckoutsKey, 1*time.Hour)
 
-	// Return the code
+	// Send the checkout job to the background worker
+	checkoutJobChan <- CheckoutJob{
+		UserID:    userID,
+		ItemID:    itemID,
+		Code:      code,
+		SaleID:    saleID,
+		CreatedAt: time.Now(),
+	}
+
+	// Return the code immediately
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(CheckoutResponse{Code: code})
 }
@@ -460,48 +910,19 @@ func purchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Begin a transaction to record the purchase and update sale count in the database
-	tx, err := db.Begin()
-	if err != nil {
-		log.Printf("Error beginning transaction: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback()
-
-	// Record the purchase
-	_, err = tx.Exec(
-		"INSERT INTO purchases (user_id, item_id, code, sale_id, purchased_at) VALUES ($1, $2, $3, $4, $5)",
-		userID, itemID, code, currentSaleID, time.Now(),
-	)
-	if err != nil {
-		log.Printf("Error inserting purchase: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Update the sale count
-	_, err = tx.Exec(
-		"UPDATE sales SET items_sold = items_sold + 1 WHERE id = $1",
-		currentSaleID,
-	)
-	if err != nil {
-		log.Printf("Error updating sale count: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Commit the transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Error committing transaction: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+	// Send the purchase job to the background worker
+	purchaseJobChan <- PurchaseJob{
+		UserID:      userID,
+		ItemID:      itemID,
+		Code:        code,
+		SaleID:      currentSaleID,
+		PurchasedAt: time.Now(),
 	}
 
 	// Generate item details
 	item := generateItem(itemID)
 
-	// Return success response
+	// Return success response immediately
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(PurchaseResponse{
 		Success:   true,
