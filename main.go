@@ -87,7 +87,7 @@ func init() {
 	// Create necessary tables if they don't exist
 	createTablesSQL := `
 	CREATE TABLE IF NOT EXISTS sales (
-		id SERIAL PRIMARY KEY,
+		id INT PRIMARY KEY, -- Using epoch timestamp as ID
 		start_time TIMESTAMP NOT NULL,
 		items_sold INT DEFAULT 0
 	);
@@ -124,29 +124,43 @@ func init() {
 	go manageSales()
 }
 
+// getSaleEpoch returns the start of the current hour in UTC as Unix timestamp
+func getSaleEpoch() int {
+	// Get current time in UTC
+	now := time.Now().UTC()
+	// Truncate to the start of the current hour
+	hourStart := now.Truncate(time.Hour)
+	// Return Unix timestamp (seconds since epoch)
+	return int(hourStart.Unix())
+}
+
 func initializeSale() {
 	saleMutex.Lock()
 	defer saleMutex.Unlock()
 
-	// Check if there's an active sale
+	// Get the current hour-aligned epoch time
+	saleEpoch := getSaleEpoch()
+
+	// Check if there's already a sale for this hour
 	var saleID int
-	var startTime time.Time
 	var itemsSold int
 
-	err := db.QueryRow("SELECT id, start_time, items_sold FROM sales ORDER BY id DESC LIMIT 1").Scan(&saleID, &startTime, &itemsSold)
+	err := db.QueryRow("SELECT id, items_sold FROM sales WHERE id = $1", saleEpoch).Scan(&saleID, &itemsSold)
 	if err != nil && err != sql.ErrNoRows {
 		log.Printf("Error checking current sale: %v", err)
 	}
 
-	// If no sale exists or the last sale is more than an hour old, create a new one
-	if err == sql.ErrNoRows || time.Since(startTime) > 1*time.Hour {
-		// Create a new sale
-		err = db.QueryRow("INSERT INTO sales (start_time, items_sold) VALUES ($1, 0) RETURNING id", time.Now()).Scan(&saleID)
+	// If no sale exists for this hour, create a new one
+	if err == sql.ErrNoRows {
+		// Create a new sale with the epoch as the ID
+		_, err = db.Exec("INSERT INTO sales (id, start_time, items_sold) VALUES ($1, $2, 0)",
+			saleEpoch, time.Unix(int64(saleEpoch), 0))
 		if err != nil {
 			log.Printf("Error creating new sale: %v", err)
 			return
 		}
 		itemsSold = 0
+		saleID = saleEpoch
 	}
 
 	currentSale = saleID
@@ -156,11 +170,16 @@ func initializeSale() {
 }
 
 func manageSales() {
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-
 	for {
-		<-ticker.C
+		// Calculate time until the next hour boundary
+		now := time.Now().UTC()
+		nextHour := now.Truncate(time.Hour).Add(time.Hour)
+		duration := nextHour.Sub(now)
+
+		// Sleep until the next hour boundary
+		time.Sleep(duration)
+
+		// Initialize the sale for the new hour
 		initializeSale()
 	}
 }
@@ -211,7 +230,10 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure sale hasn't sold out
+	// Ensure we're using the current hour's sale
+	initializeSale()
+
+	// Get the current sale ID
 	saleMutex.Lock()
 	saleID := currentSale
 	saleMutex.Unlock()
@@ -288,6 +310,14 @@ func purchaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ensure we're using the current hour's sale
+	initializeSale()
+
+	// Get the current sale ID
+	saleMutex.Lock()
+	currentSaleID := currentSale
+	saleMutex.Unlock()
+
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		http.Error(w, "Missing code param", http.StatusBadRequest)
@@ -316,6 +346,12 @@ func purchaseHandler(w http.ResponseWriter, r *http.Request) {
 	userID := codeData[0]
 	itemID := codeData[1]
 	saleID, _ := strconv.Atoi(codeData[2])
+
+	// Verify that the code is from the current sale window
+	if saleID != currentSaleID {
+		http.Error(w, "Code is from a previous sale window and has expired", http.StatusBadRequest)
+		return
+	}
 
 	// Check if code has been used
 	var used bool
