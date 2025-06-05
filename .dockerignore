@@ -1,0 +1,34 @@
+README.md
+CHANGELOG.md
+docker-compose.yml
+Dockerfile
+
+.git
+.gitattributes
+.gitignore
+
+contrib/
+
+# Temporary files
+*~
+*#
+.#*
+
+# Vendors
+node_modules/
+vendor/
+
+# Binaries for programs and plugins
+dist/
+gin-bin
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out

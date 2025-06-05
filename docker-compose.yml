@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  app:
+    image: golang:1.24-alpine
+    working_dir: /app
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - postgres
+    command: >
+      sh -c "go mod download && go run main.go"
+    
+    environment:
+      - REDIS_URL=redis:6379
+      - POSTGRES_URL=postgres://postgres:postgres@postgres/flashsale?sslmode=disable
+    
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+  
+  postgres:
+    image: postgres:alpine
+    environment:
+      - POSTGRES_DB=flashsale
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  
+volumes:
+  postgres_data:
