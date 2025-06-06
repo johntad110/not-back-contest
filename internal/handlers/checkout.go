@@ -5,10 +5,10 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/google/uuid"
 	"github.com/user/not-contest/internal/db"
 	"github.com/user/not-contest/internal/models"
 	"github.com/user/not-contest/internal/service"
+	"github.com/user/not-contest/internal/utils" // Import the new utils package
 )
 
 // CheckoutHandler handles checkout requests
@@ -79,7 +79,12 @@ func (h *CheckoutHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate a unique code
-	code := uuid.New().String()
+	code, err := utils.GenerateCode()
+	if err != nil {
+		log.Printf("Failed to generate code: %v", err)
+		http.Error(w, "Failed to generate code", http.StatusInternalServerError)
+		return
+	}
 
 	// Store code in Redis with expiration
 	if err := h.RedisManager.StoreCode(code, userID, itemID, saleID); err != nil {
