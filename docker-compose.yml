@@ -12,7 +12,7 @@ services:
       - redis
       - postgres
     command: >
-      sh -c "go mod download && go run main.go"
+      sh -c "go mod download && go run cmd/server/main.go"
     
     environment:
       - REDIS_URL=redis:6379
