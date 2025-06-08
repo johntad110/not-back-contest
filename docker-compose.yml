@@ -33,5 +33,14 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
   
+  wrk:
+    image: williamyeh/wrk
+    volumes:
+      - .:/data
+    networks:
+      - default
+    depends_on:
+      - app
+  
 volumes:
   postgres_data:
