@@ -55,12 +55,6 @@ if userPurchases >= tonumber(ARGV[2]) then
     return {0, "User limit reached"}
 end
 
--- Still track checkouts for informational purposes
--- Increment the user's checkout counter. This tracks how many items a user has
--- attempted to checkout, which can be useful for debugging or reconciliation.
-redis.call('INCR', userCheckoutsKey)
-redis.call('EXPIRE', userCheckoutsKey, 3600) -- 1 hour expiration
-
 -- Store the code if provided
 if ARGV[3] ~= "" then
     local codeKey = "code:"..ARGV[3]
