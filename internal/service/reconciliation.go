@@ -48,8 +48,8 @@ func (s *ReconciliationService) StartReconciliation() {
 // 4. Reconciling codes: ensuring codes in Redis are reflected in PostgreSQL.
 // 5. Reconciling user purchases: synchronizing user purchase counts.
 func (s *ReconciliationService) reconcileRedisWithDB() {
-	// Create a ticker that fires every 10 seconds.
-	ticker := time.NewTicker(10 * time.Second)
+	// Create a ticker that fires every 10 Minute.
+	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop() // Ensure the ticker is stopped when the function exits.
 
 	// Loop indefinitely, executing on each tick.
