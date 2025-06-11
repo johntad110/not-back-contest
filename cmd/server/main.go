@@ -99,6 +99,11 @@ func main() {
 	if err := postgresManager.EnsureSaleExists(currentSaleID); err != nil {
 		log.Fatalf("Failed to ensure sale exists: %v", err)
 	}
+	// The above ensurer created the sale if it doesn't exist
+	// And if we create it we need to update redis
+	if err := redisManager.SetCurrentSaleID(currentSaleID); err != nil {
+		log.Printf("ERROR: Failed to update current sale ID in Redis: %v", err)
+	}
 
 	// Set up the HTTP server multiplexer and register the handlers
 	// for the defined API endpoints.

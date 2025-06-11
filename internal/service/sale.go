@@ -91,7 +91,18 @@ func (s *SaleService) manageSales() {
 		// }
 		// And similarly for clearing old user checkouts/purchases from Redis.
 
-		log.Printf("INFO: Successfully created new sale with ID %d.", newSaleID)
+		// Update Redis with new sale ID
+		if err := s.RedisManager.SetCurrentSaleID(newSaleID); err != nil {
+			log.Printf("ERROR: Failed to update current sale ID in Redis: %v", err)
+			continue
+		}
+
+		// Initialize Redis counters for new sale
+		if err := s.RedisManager.InitializeSaleCounters(newSaleID); err != nil {
+			log.Printf("ERROR: Failed to initialize Redis counters for sale %d: %v", newSaleID, err)
+		}
+
+		log.Printf("INFO: Successfully created new sale with ID %d and updated Redis.", newSaleID)
 	}
 }
 

@@ -34,23 +34,41 @@ import (
 //	{0, "User limit reached"} if the user's purchase limit is reached.
 //	{1, "Success"} if the checkout is valid and the user's checkout counter is incremented.
 const CheckoutScript = `
-local saleTotal = tonumber(redis.call('GET', KEYS[1]) or 0)
+local currentSaleID = tonumber(redis.call('GET', 'current:sale:id'))
+if not currentSaleID then
+    return {0, "No active sale"}
+end
+
+local saleKey = "sale:"..currentSaleID..":total"
+local userPurchasesKey = "sale:"..currentSaleID..":user:"..KEYS[1]..":purchases"
+local userCheckoutsKey = "sale:"..currentSaleID..":user:"..KEYS[1]..":checkouts"
+
+-- Check sale limit
+local saleTotal = tonumber(redis.call('GET', saleKey) or 0)
 if saleTotal >= tonumber(ARGV[1]) then
-  return {0, "Sale sold out"}
+    return {0, "Sale sold out"}
 end
 
 -- Only check purchases against the limit, not checkouts, as checkouts are temporary.
-local userPurchases = tonumber(redis.call('GET', KEYS[2]) or 0)
+local userPurchases = tonumber(redis.call('GET', userPurchasesKey) or 0)
 if userPurchases >= tonumber(ARGV[2]) then
-  return {0, "User limit reached"}
+    return {0, "User limit reached"}
 end
 
 -- Still track checkouts for informational purposes
 -- Increment the user's checkout counter. This tracks how many items a user has
 -- attempted to checkout, which can be useful for debugging or reconciliation.
-redis.call('INCR', KEYS[3])
-redis.call('EXPIRE', KEYS[3], 3600) -- 1 hour expiration
-return {1, "Success"}
+redis.call('INCR', userCheckoutsKey)
+redis.call('EXPIRE', userCheckoutsKey, 3600) -- 1 hour expiration
+
+-- Store the code if provided
+if ARGV[3] ~= "" then
+    local codeKey = "code:"..ARGV[3]
+    local codeValue = KEYS[1]..":"..ARGV[4]..":"..currentSaleID
+    redis.call('SET', codeKey, codeValue, 'EX', ARGV[5])
+end
+
+return {1, "Success", currentSaleID}
 `
 
 // PurchaseScript is a Lua script executed atomically on Redis.
@@ -142,34 +160,29 @@ func NewRedisManager(client *redis.Client, ctx context.Context) *RedisManager {
 //	bool: True if the checkout is successful and allowed, false otherwise.
 //	string: A message indicating the reason for success or failure (e.g., "Success", "Sale sold out").
 //	error: An error if the Redis script execution fails, otherwise nil.
-func (rm *RedisManager) ExecuteCheckoutScript(saleID int, userID string) (bool, string, error) {
-	saleKey := fmt.Sprintf("sale:%d:total", saleID)
-	userPurchasesKey := fmt.Sprintf("sale:%d:user:%s:purchases", saleID, userID)
-	userCheckoutsKey := fmt.Sprintf("sale:%d:user:%s:checkouts", saleID, userID)
-
+func (rm *RedisManager) ExecuteCheckoutScript(userID, itemID, generatedCode string) (bool, string, int, error) {
 	// Execute the pre-defined Lua script with the necessary keys and arguments.
 	result, err := rm.Client.Eval(rm.Ctx, CheckoutScript, []string{
-		saleKey,
-		userPurchasesKey,
-		userCheckoutsKey,
-	}, models.MaxItemsPerSale, models.MaxItemsPerUser).Result()
+		userID, // KEYS[1]
+	}, models.MaxItemsPerSale, models.MaxItemsPerUser, generatedCode, itemID, int(models.CodeExpiration.Seconds())).Result()
 
 	if err != nil {
-		log.Printf("Error executing checkout script for user %s in sale %d: %v", userID, saleID, err)
-		return false, "", fmt.Errorf("error executing checkout script: %w", err)
+		log.Printf("Error executing checkout script for user %s: %v", userID, err)
+		return false, "", 0, fmt.Errorf("error executing checkout script: %w", err)
 	}
 
 	// Parse the script's return value, which is expected to be a slice of interfaces.
 	resultArray, ok := result.([]interface{})
-	if !ok || len(resultArray) < 2 {
+	if !ok || len(resultArray) < 3 {
 		log.Printf("Invalid result format from checkout script: %v", result)
-		return false, "", fmt.Errorf("invalid result format from checkout script")
+		return false, "", 0, fmt.Errorf("invalid result format from checkout script")
 	}
 
 	success, _ := resultArray[0].(int64)
 	message, _ := resultArray[1].(string)
+	saleID, _ := resultArray[2].(int64)
 
-	return success == 1, message, nil
+	return success == 1, message, int(saleID), nil
 }
 
 // ExecutePurchaseScript executes the `PurchaseScript` atomically on Redis.
@@ -546,4 +559,13 @@ func (rm *RedisManager) GetAllUserPurchaseKeys(saleID int) ([]string, error) {
 		return nil, fmt.Errorf("failed to get all user purchase keys: %w", err)
 	}
 	return keys, nil
+}
+
+func (rm *RedisManager) SetCurrentSaleID(saleID int) error {
+	return rm.Client.Set(rm.Ctx, "current:sale:id", saleID, 0).Err()
+}
+
+func (rm *RedisManager) InitializeSaleCounters(saleID int) error {
+	totalKey := fmt.Sprintf("sale:%d:total", saleID)
+	return rm.Client.Set(rm.Ctx, totalKey, 0, time.Hour).Err()
 }

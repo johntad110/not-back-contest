@@ -79,17 +79,11 @@ func (h *CheckoutHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Retrieve the ID of the current active flash sale.
-	saleID, err := h.SaleService.GetCurrentSaleID()
+	// Generate a unique alphanumeric code for this checkout attempt.
+	code, err := utils.GenerateCode()
 	if err != nil {
-		log.Printf("ERROR: Failed to get current sale ID for user %s, item %s: %v", userID, itemID, err)
-		http.Error(w, "Failed to get current sale", http.StatusInternalServerError)
-		return
-	}
-
-	// If no active sale exists, return an error.
-	if saleID == 0 {
-		http.Error(w, "No active sale", http.StatusNotFound)
+		log.Printf("ERROR: Failed to generate unique code for user %s, item %s: %v", userID, itemID, err)
+		http.Error(w, "Failed to generate checkout code", http.StatusInternalServerError)
 		return
 	}
 
@@ -97,7 +91,7 @@ func (h *CheckoutHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	// This script checks if the overall sale limit or the user's individual
 	// purchase limit has been reached. It also atomically increments the user's
 	// checkout counter in Redis.
-	success, message, err := h.RedisManager.ExecuteCheckoutScript(saleID, userID)
+	success, message, saleID, err := h.RedisManager.ExecuteCheckoutScript(userID, itemID, code)
 	if err != nil {
 		log.Printf("ERROR: Failed to execute Redis checkout script for user %s, item %s, sale %d: %v", userID, itemID, saleID, err)
 		http.Error(w, "Failed to process checkout", http.StatusInternalServerError)
@@ -111,30 +105,12 @@ func (h *CheckoutHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a unique alphanumeric code for this checkout attempt.
-	code, err := utils.GenerateCode()
-	if err != nil {
-		log.Printf("ERROR: Failed to generate unique code for user %s, item %s: %v", userID, itemID, err)
-		http.Error(w, "Failed to generate checkout code", http.StatusInternalServerError)
-		return
-	}
-
 	// Store the generated code in Redis with an expiration. This code acts as a
 	// temporary token that the user can use to complete the purchase later.
 	if err := h.RedisManager.StoreCode(code, userID, itemID, saleID); err != nil {
 		log.Printf("ERROR: Failed to store code %s in Redis for user %s, item %s, sale %d: %v", code, userID, itemID, saleID, err)
 		http.Error(w, "Failed to store checkout code", http.StatusInternalServerError)
 		return
-	}
-
-	// Set/refresh expiration on the user's checkouts key in Redis. This ensures
-	// that user-specific checkout counts are properly maintained and eventually cleaned up.
-	// TO-DO: Rremov this if it doesn't cause any issues, Because the `ExecuteCheckoutScript` already increments, this `SetUserCheckouts` might be redundant
-	// set a specific value. Assuming it sets the count to 1 for simplicity if not already set.
-	if err := h.RedisManager.SetUserCheckouts(saleID, userID, 1); err != nil {
-		log.Printf("WARNING: Failed to set user checkouts expiration for user %s, sale %d: %v", userID, saleID, err)
-		// This is a non-fatal error, as the core checkout logic has succeeded via Redis script.
-		// We log it but don't return an HTTP error.
 	}
 
 	// Asynchronously persist the checkout attempt to PostgreSQL.
