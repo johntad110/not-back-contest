@@ -50,8 +50,7 @@ func (w *CheckoutWorker) processCheckoutJobs() {
 	// The `for job := range w.CheckoutChan` loop blocks until a job is available
 	// on the channel, and then processes it. This loop runs indefinitely.
 	for job := range w.CheckoutChan {
-		log.Printf("INFO: Processing checkout job: UserID=%s, SaleID=%d, ItemID=%s, Code=%s",
-			job.UserID, job.SaleID, job.ItemID, job.Code)
+		// log.Printf("INFO: Processing checkout job: UserID=%s, SaleID=%d, ItemID=%s, Code=%s", job.UserID, job.SaleID, job.ItemID, job.Code)
 
 		// Attempt to create the checkout attempt record in the PostgreSQL database.
 		_, err := w.PostgresManager.CreateCheckoutAttempt(job.UserID, job.SaleID, job.ItemID, job.Code)
@@ -62,7 +61,7 @@ func (w *CheckoutWorker) processCheckoutJobs() {
 			// might use a separate retry queue or a backoff strategy.
 			go w.retryCheckoutJob(job)
 		} else {
-			log.Printf("INFO: Successfully recorded checkout attempt for code %s in DB.", job.Code)
+			// log.Printf("INFO: Successfully recorded checkout attempt for code %s in DB.", job.Code)
 		}
 	}
 }
