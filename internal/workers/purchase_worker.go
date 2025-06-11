@@ -51,8 +51,7 @@ func (w *PurchaseWorker) processPurchaseJobs() {
 	// The `for job := range w.PurchaseChan` loop blocks until a job is available
 	// on the channel, and then processes it. This loop runs indefinitely.
 	for job := range w.PurchaseChan {
-		log.Printf("INFO: Processing purchase job: UserID=%s, SaleID=%d, ItemID=%s, Code=%s",
-			job.UserID, job.SaleID, job.ItemID, job.Code)
+		// log.Printf("INFO: Processing purchase job: UserID=%s, SaleID=%d, ItemID=%s, Code=%s", job.UserID, job.SaleID, job.ItemID, job.Code)
 
 		// Attempt to process the purchase, including database updates.
 		if err := w.processPurchase(job); err != nil {
@@ -118,7 +117,7 @@ func (w *PurchaseWorker) processPurchase(job models.PurchaseJob) error {
 	if err != nil {
 		return fmt.Errorf("failed to mark checkout attempt %d as used for code %s: %w", checkoutID, job.Code, err)
 	}
-	log.Printf("INFO: Marked checkout attempt %d as used for code %s.", checkoutID, job.Code)
+	// log.Printf("INFO: Marked checkout attempt %d as used for code %s.", checkoutID, job.Code)
 
 	// Create a new purchase record in the database.
 	// This records the final, confirmed purchase.
@@ -135,7 +134,7 @@ func (w *PurchaseWorker) processPurchase(job models.PurchaseJob) error {
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction for purchase code %s: %w", job.Code, err)
 	}
-	log.Printf("INFO: Successfully committed purchase for code %s.", job.Code)
+	// log.Printf("INFO: Successfully committed purchase for code %s.", job.Code)
 
 	return nil // Return nil if everything was successful.
 }
