@@ -15,10 +15,19 @@ HOST="http://app:8080"
 THREADS=8
 CONNS=500
 DURATION="30s"
-EXPORT_COUNT=1000     # how many codes to pull from Postgres
+EXPORT_COUNT=10000     # how many codes to pull from Postgres
 CODES_FILE="codes.txt"
 PURCHASE_LUA="purchase_test.lua"
 # — /CONFIGURATION ————————————
+
+docker-compose up -d
+
+# echo -n "Waiting for ${HOST}..."
+# until curl -s ${HOST} &> /dev/null; do
+#   sleep 1
+#   echo -n "."
+# done
+# echo " OK"
 
 echo "1/3 ▸ Checkout load test (random users/items)…"
 docker-compose run --rm wrk -t${THREADS} -c${CONNS} -d${DURATION} -s ./random_checkout.lua ${HOST}
@@ -56,4 +65,4 @@ EOF
 docker-compose run --rm wrk -t${THREADS} -c${CONNS} -d${DURATION} -s ./purchase_test.lua ${HOST}
 
 echo
-echo "✅ All load tests complete."
+echo "✅ All load tests complete. If there are huge Non 2xx responses that is because only the first 10K purchases are allowed"
